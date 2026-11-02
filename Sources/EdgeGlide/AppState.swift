@@ -36,6 +36,26 @@ final class AppState {
     var lastError: String?
     var lastAction: String?
     var launchAtLogin = false
+    var loginNeedsApproval = false
+
+    // Structured health flags for the panel's status line. The strings above
+    // keep the detail for the Diagnostics group.
+    var trackpadOK = false
+    var volumeOK = false
+    var brightnessOK = false
+    var mediaKeysAllowed = false
+    var mediaRemoteReady = false
+
+    // MARK: Gesture feedback for the panel diagram
+
+    /// The zone of the most recent gesture and when it fired.
+    var lastFired: FiredZone?
+    /// The zone the diagram highlights now. Cleared shortly after the last event.
+    var activeZone: GestureZone?
+    private var clearHighlight: Task<Void, Never>?
+
+    /// The Settings tab on screen. Kept here because `@State` isn't available.
+    var settingsTab: SettingsTab = .gestures
 
     // MARK: Components
 
@@ -109,9 +129,11 @@ final class AppState {
         do {
             let devices = try monitor.start()
             let builtIn = devices.filter(\.isBuiltIn).count
+            trackpadOK = true
             trackpadStatus = "Trackpad: connected (\(devices.count) device\(devices.count == 1 ? "" : "s"), \(builtIn) built-in)"
             Log.touch.notice("\(self.trackpadStatus, privacy: .public)")
         } catch {
+            trackpadOK = false
             trackpadStatus = "Trackpad: \(error.localizedDescription)"
             report(error, in: "Trackpad")
         }
@@ -119,15 +141,19 @@ final class AppState {
 
     /// Reads every component's state without changing anything.
     func refreshStatus() {
-        do { volumeStatus = "Volume: \(try volume.describe())" } catch {
+        do { volumeStatus = "Volume: \(try volume.describe())"; volumeOK = true } catch {
+            volumeOK = false
             volumeStatus = "Volume: \(error.localizedDescription)"
             Log.volume.error("\(error.localizedDescription, privacy: .public)")
         }
-        do { brightnessStatus = "Brightness: \(try brightness.describe())" } catch {
+        do { brightnessStatus = "Brightness: \(try brightness.describe())"; brightnessOK = true } catch {
+            brightnessOK = false
             brightnessStatus = "Brightness: \(error.localizedDescription)"
             Log.brightness.error("\(error.localizedDescription, privacy: .public)")
         }
         mediaStatus = "Media: \(media.describe())"
+        mediaKeysAllowed = media.canPostEvents
+        mediaRemoteReady = media.loadError == nil
         hapticsStatus = "Haptics: \(haptics.status)"
         refreshLoginStatus()
         Log.app.notice(
@@ -138,6 +164,7 @@ final class AppState {
 
     private func handle(_ events: [EdgeGestureEvent], deviceID: UInt64) {
         for event in events {
+            markFired(GestureZone(event))
             do {
                 switch event {
                 case .volumeDelta(let delta):
@@ -163,6 +190,29 @@ final class AppState {
         }
         hapticsStatus = "Haptics: \(haptics.status)"
     }
+
+    private func markFired(_ zone: GestureZone) {
+        lastFired = FiredZone(zone: zone, at: Date())
+        activeZone = zone
+        clearHighlight?.cancel()
+        clearHighlight = Task { @MainActor [weak self] in
+            try? await Task.sleep(for: .milliseconds(450))
+            guard !Task.isCancelled else { return }
+            self?.activeZone = nil
+        }
+    }
+
+    /// Plays one haptic tick at the current strength, on the first built-in
+    /// trackpad when there is one.
+    func testHaptic() {
+        let device = monitor.devices.first(where: \.isBuiltIn) ?? monitor.devices.first
+        haptics.tick(deviceID: device?.id ?? 0)
+        hapticsStatus = "Haptics: \(haptics.status)"
+    }
+
+    func clearLastError() { lastError = nil }
+
+    func openLoginItemsSettings() { SMAppService.openSystemSettingsLoginItems() }
 
     private func report(_ error: Error, in context: String) {
         let message = "\(context): \(error.localizedDescription)"
@@ -191,6 +241,7 @@ final class AppState {
     private func refreshLoginStatus() {
         let status = SMAppService.mainApp.status
         launchAtLogin = status == .enabled
+        loginNeedsApproval = status == .requiresApproval
         switch status {
         case .enabled: loginStatus = "Launch at login: on"
         case .notRegistered: loginStatus = "Launch at login: off"
@@ -199,4 +250,27 @@ final class AppState {
         @unknown default: loginStatus = "Launch at login: unknown status \(status.rawValue)"
         }
     }
+}
+
+/// The four trackpad zones, as the panel diagram draws them.
+enum GestureZone: String, CaseIterable, Sendable {
+    case volume, brightness, mute, tracks
+
+    init(_ event: EdgeGestureEvent) {
+        switch event {
+        case .volumeDelta: self = .volume
+        case .brightnessDelta: self = .brightness
+        case .toggleMute: self = .mute
+        case .nextTrack, .previousTrack: self = .tracks
+        }
+    }
+}
+
+struct FiredZone: Equatable, Sendable {
+    let zone: GestureZone
+    let at: Date
+}
+
+enum SettingsTab: String, CaseIterable, Hashable, Sendable {
+    case gestures, feel, about
 }
